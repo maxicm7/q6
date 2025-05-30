@@ -19,6 +19,12 @@ if "Individual" not in creator.__dict__:
 
 # ----------------------- Funciones Auxiliares (Adaptadas para recibir parámetros) -----------------------
 
+# Use session_state for caching to ensure data persists across reruns caused by user interaction
+# This is often better than st.cache_data for mutable data or objects like DFs that change state
+# Streamlit recommends st.cache_data/resource but session_state can be simpler for this use case
+# if you want the DF to be readily available without recalculating or hashing.
+# However, for simple loading, st.cache_data is generally preferred if possible.
+# Let's stick to st.cache_data for the load function as recommended by Streamlit best practices.
 @st.cache_data # Cache the data loading result
 def load_data(uploaded_file):
     """Carga y valida el archivo CSV."""
@@ -29,6 +35,7 @@ def load_data(uploaded_file):
             if 'Numero' in df.columns and 'Atraso' in df.columns:
                 df['Numero'] = df['Numero'].astype(str)
                 # Convert Atraso to numeric, coerce errors to NaN, fill NaN with -1, then to int
+                # Using -1 to signify invalid/missing atraso
                 df['Atraso'] = pd.to_numeric(df['Atraso'], errors='coerce').fillna(-1).astype(int)
                 st.success("Archivo cargado exitosamente.")
                 st.dataframe(df.head())
@@ -48,13 +55,12 @@ def generar_combinaciones_con_restricciones(distribucion_probabilidad, numero_a_
     Adaptada para recibir datos y restricciones como argumentos.
     """
     valores = list(distribucion_probabilidad.keys())
-    # probabilidades = list(distribucion_probabilidad.values()) # No se usan directamente en el bucle de selección
 
     combinaciones = []
 
     for _ in range(n_combinaciones):
         seleccionados = []
-        atrasos_seleccionados = Counter()
+        atrasos_seleccionados_counter = Counter() # Usamos Counter directamente para los atrasos seleccionados
         usados = set() # Conjunto para rastrear valores ya seleccionados en esta combinación
 
         # Iterar hasta seleccionar n_selecciones números o hasta que no haya más opciones válidas
@@ -67,8 +73,9 @@ def generar_combinaciones_con_restricciones(distribucion_probabilidad, numero_a_
                  if valor not in usados: # Solo considerar números no seleccionados aún
                      atraso = numero_a_atraso.get(valor)
                      # Verificar si el atraso es válido (-1 indica error) y si la restricción lo permite
-                     # Usamos str(atraso) porque las claves de restricciones pueden ser strings
-                     if atraso is not None and atraso != -1 and atrasos_seleccionados.get(str(atraso), 0) < restricciones_atraso.get(str(atraso), n_selecciones):
+                     # Usamos str(atraso) porque las claves de restricciones son strings
+                     # Si un atraso no tiene restricción explícita, el .get() devolverá n_selecciones, permitiendo cualquier cantidad hasta 6.
+                     if atraso is not None and atraso != -1 and atrasos_seleccionados_counter.get(str(atraso), 0) < restricciones_atraso.get(str(atraso), n_selecciones):
                           valores_posibles.append(valor)
                           probabilidades_posibles.append(prob)
 
@@ -79,12 +86,17 @@ def generar_combinaciones_con_restricciones(distribucion_probabilidad, numero_a_
             # Normalizar probabilidades de los valores posibles
             total_probabilidades_posibles = sum(probabilidades_posibles)
             if total_probabilidades_posibles == 0: # Evitar división por cero
+                # This can happen if all remaining possible values have probability 0
                 break
             probabilidades_posibles_normalized = [p / total_probabilidades_posibles for p in probabilidades_posibles]
 
 
             # Elegir un nuevo valor basado en las probabilidades normalizadas
-            nuevo_valor = random.choices(valores_posibles, weights=probabilidades_posibles_normalized, k=1)[0]
+            # Usar k=1 para obtener solo un elemento y acceder a él con [0]
+            try:
+                 nuevo_valor = random.choices(valores_posibles, weights=probabilidades_posibles_normalized, k=1)[0]
+            except IndexError: # random.choices might return empty list if weights are somehow problematic
+                 break # Cannot select, break the loop
 
             # Añadir el valor seleccionado a la combinación y marcarlo como usado
             seleccionados.append(nuevo_valor)
@@ -93,7 +105,7 @@ def generar_combinaciones_con_restricciones(distribucion_probabilidad, numero_a_
             # Actualizar el contador de atrasos seleccionados para esta combinación
             atraso = numero_a_atraso.get(nuevo_valor)
             if atraso is not None and atraso != -1:
-                atrasos_seleccionados[str(atraso)] += 1 # Usar string key
+                atrasos_seleccionados_counter[str(atraso)] += 1 # Usar string key for consistency with restrictions
 
         # Si se completó una combinación válida (con el número correcto de selecciones)
         if len(seleccionados) == n_selecciones:
@@ -108,6 +120,7 @@ def generar_combinaciones_con_restricciones(distribucion_probabilidad, numero_a_
         # Calcular la probabilidad de la combinación como el producto de las probabilidades individuales
         prob_comb = 1.0
         try:
+            # Usar .get con valor por defecto 0 en caso de que algún número no esté en la distribución
             prob_comb = np.prod([distribucion_probabilidad.get(val, 0) for val in combinacion])
         except Exception:
             # En caso de error al calcular la probabilidad (ej: valor no encontrado), asignar 0
@@ -130,15 +143,17 @@ def procesar_combinaciones(distribucion_probabilidad, numero_a_atraso, restricci
     task_args = (distribucion_probabilidad, numero_a_atraso, restricciones_atraso, n_selecciones, n_combinaciones)
 
     # Usar ProcessPoolExecutor para paralelizar
+    # max_workers=None usa el número de CPUs
     with ProcessPoolExecutor() as executor:
         futures = [executor.submit(generar_combinaciones_con_restricciones, *task_args) for _ in range(n_ejecuciones)]
 
-        # Monitorear progreso (opcional)
-        # No es trivial mostrar un progreso perfecto con as_completed en Streamlit sin actualizar la UI constantemente
-        # Pero podemos esperar a que terminen.
-        for i, future in enumerate(as_completed(futures)):
+        # Monitorear progreso (opcional) - Difficult to update progress bar inside as_completed easily in Streamlit
+        # without potential UI blocking or complex threading. Simple spinner is better.
+        for future in as_completed(futures):
+            # futures.index(future) # This is inefficient to get index inside as_completed
             resultados_por_ejecucion.append(future.result())
-            # st.text(f"Completada ejecución {i+1}/{n_ejecuciones}") # Esto refrescaría mucho la UI
+            # If you wanted to show progress, you'd need a different approach,
+            # like storing futures and checking if done, updating a progress bar outside the loop.
 
     return resultados_por_ejecucion
 
@@ -173,26 +188,27 @@ def generar_individuo_deap(distribucion_prob, num_atraso, restr_atraso, n_sel):
     """Genera un individuo (combinación) válido para DEAP."""
     valores = list(distribucion_prob.keys())
     combinacion = []
-    atrasos_seleccionados = Counter()
+    atrasos_seleccionados_counter = Counter()
     usados = set() # Usar set para rastrear números usados
+
+    # Shuffle valores initially to add randomness to the starting point
+    random.shuffle(valores)
 
     while len(combinacion) < n_sel:
         valores_posibles = []
-        # En GA, la generación inicial puede ser uniforme entre los posibles
-        # La evaluación y selección se encargan de la probabilidad
-
+        # Only iterate through values not already used in this individual
         for valor in valores:
             if valor not in usados:
                 atraso = num_atraso.get(valor)
                 # Verificar si atraso es válido y si la restricción lo permite
-                if atraso is not None and atraso != -1 and atrasos_seleccionados.get(str(atraso), 0) < restr_atraso.get(str(atraso), n_sel):
+                if atraso is not None and atraso != -1 and atrasos_seleccionados_counter.get(str(atraso), 0) < restr_atraso.get(str(atraso), n_sel):
                     valores_posibles.append(valor)
 
         if not valores_posibles:
             # No se pueden añadir más números que cumplan las restricciones
             break
 
-        # Elegir uniformemente entre los valores posibles
+        # Elegir uniformemente entre los valores posibles para la generación inicial
         nuevo_valor = random.choice(valores_posibles)
 
         combinacion.append(nuevo_valor)
@@ -200,12 +216,13 @@ def generar_individuo_deap(distribucion_prob, num_atraso, restr_atraso, n_sel):
 
         atraso = num_atraso.get(nuevo_valor)
         if atraso is not None and atraso != -1:
-            atrasos_seleccionados[str(atraso)] += 1
+            atrasos_seleccionados_counter[str(atraso)] += 1
 
     # Asegurarse de que el individuo tenga el tamaño correcto (si no, no será válido)
     # y convertirlo al tipo Individual de DEAP.
-    # Si el bucle se rompió antes de n_sel, devuelve una lista incompleta que será penalizada.
-    return creator.Individual(sorted(combinacion))
+    # Si el bucle se rompió antes de n_sel, devuelve una lista incompleta que será penalizada por la evaluación.
+    # Return as a list first, it will be converted to creator.Individual by the toolbox init.
+    return sorted(combinacion)
 
 
 def evaluar_individuo_deap(individuo, distribucion_prob, num_atraso, restr_atraso, n_sel):
@@ -215,19 +232,24 @@ def evaluar_individuo_deap(individuo, distribucion_prob, num_atraso, restr_atras
         return (0,)
 
     # Verificar restricciones de atraso
-    atrasos_seleccionados = Counter([num_atraso.get(val) for val in individuo if num_atraso.get(val) is not None and num_atraso.get(val) != -1])
-    for atraso_str, cantidad in atrasos_seleccionados.items():
+    atrasos_seleccionados_counter = Counter([num_atraso.get(val) for val in individuo if num_atraso.get(val) is not None and num_atraso.get(val) != -1])
+    for atraso_str, cantidad in atrasos_seleccionados_counter.items():
         # Usar str(atraso) para coincidir con las claves de restricciones
-        if cantidad > restr_atraso.get(atraso_str, n_sel):
+         # Get restriction for this atraso, default to n_sel if not explicitly restricted
+        restriction = restr_atraso.get(atraso_str, n_sel)
+        if cantidad > restriction:
             return (0,)  # Penalizar si no cumple las restricciones
 
     # Calcular la probabilidad de la combinación (fitness)
     probabilidad = 1.0
     try:
         # Usar .get con valor por defecto 0 en caso de que algún número no esté en la distribución
-        probabilidad = np.prod([distribucion_prob.get(val, 0) for val in individuo])
+        # If any value in the individual is not in the probability distribution, probability is 0.
+        if any(val not in distribucion_prob for val in individuo):
+             return (0,)
+        probabilidad = np.prod([distribucion_prob[val] for val in individuo])
     except Exception:
-        # En caso de error (ej: datos inconsistentes), penalizar
+        # Should not happen if `any` check passes, but as a safeguard
         probabilidad = 0
 
     return (probabilidad,)  # Devolver la probabilidad como fitness (tupla)
@@ -237,8 +259,10 @@ def ejecutar_algoritmo_genetico(n_generaciones, n_poblacion, cxpb, mutpb, distri
     """Ejecuta el algoritmo genético con DEAP."""
 
     # Configurar el toolbox *antes* de la ejecución, usando los parámetros actuales
+    # Register functions using lambda to pass arguments
     toolbox = base.Toolbox()
-    toolbox.register("individual", generar_individuo_deap, distribucion_prob, numero_a_atraso, restricciones_atraso, n_selecciones)
+    toolbox.register("individual", tools.initIterate, creator.Individual,
+                     lambda: generar_individuo_deap(distribucion_prob, numero_a_atraso, restricciones_atraso, n_selecciones))
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     toolbox.register("evaluate", evaluar_individuo_deap, distribucion_prob, numero_a_atraso, restricciones_atraso, n_selecciones)
     toolbox.register("mate", tools.cxTwoPoint)
@@ -248,33 +272,61 @@ def ejecutar_algoritmo_genetico(n_generaciones, n_poblacion, cxpb, mutpb, distri
 
     # Crear la población inicial
     # Manejar el caso donde no se puedan generar individuos válidos (ej: restricciones imposibles)
-    try:
-        population = toolbox.population(n=n_poblacion)
-        if not population:
-             return None, 0.0, "No se pudo generar una población inicial válida con las restricciones dadas."
+    population = []
+    attempts = 0
+    max_attempts = n_poblacion * 10 # Try creating individuals for a limited number of times
+    with st.spinner("Generando población inicial para el Algoritmo Genético..."):
+        while len(population) < n_poblacion and attempts < max_attempts:
+            try:
+                ind = toolbox.individual()
+                if len(ind) == n_selecciones: # Only add if the individual generator succeeded in creating a full individual
+                   population.append(ind)
+                # else: # Optionally print why an individual was not valid from generator
+                   # print(f"Skipping incomplete individual during init: {ind}")
 
-    except Exception as e:
-        return None, 0.0, f"Error al crear la población inicial: {e}"
+            except Exception as e:
+                 # print(f"Error generating individual: {e}") # For debugging generator issues
+                 pass # Silently fail generation if issues
+            attempts += 1
 
+
+    if not population:
+        return None, 0.0, "No se pudo generar una población inicial válida con las restricciones dadas. Revisa las restricciones o los datos."
 
     # Ejecutar el algoritmo genético
+    st.info(f"Población inicial generada ({len(population)} individuos válidos). Ejecutando AG...")
     # Desactivar verbose para no llenar la consola de Streamlit
-    algorithms.eaSimple(population, toolbox,
+    try:
+        algorithms.eaSimple(population, toolbox,
                           cxpb=cxpb,
                           mutpb=mutpb,
                           ngen=n_generaciones,
                           stats=None, # No mostrar estadísticas detalladas por generación en la UI
                           halloffame=None, # No necesitamos un hall of fame separado para este caso
                           verbose=False) # Silenciar salida de DEAP
+    except Exception as e:
+        return None, 0.0, f"Error durante la ejecución del Algoritmo Genético: {e}"
+
 
     # Obtener el mejor individuo de la población final
     # selBest devuelve una lista, tomamos el primer elemento
     if population:
+        # Evaluate the final population to ensure fitness values are up-to-date
+        # DEAP's eaSimple does this internally for the final population
         best_ind = tools.selBest(population, k=1)[0]
-        best_fitness = evaluar_individuo_deap(best_ind, distribucion_prob, numero_a_atraso, restricciones_atraso, n_selecciones)[0]
+        best_fitness = best_ind.fitness.values[0] if best_ind.fitness.valid else evaluar_individuo_deap(best_ind, distribucion_prob, numero_a_atraso, restricciones_atraso, n_selecciones)[0]
+
+        # Double check fitness just in case
+        evaluated_fitness = evaluar_individuo_deap(best_ind, distribucion_prob, numero_a_atraso, restricciones_atraso, n_selecciones)[0]
+        if best_fitness != evaluated_fitness:
+             # This indicates an issue, maybe fitness was not updated correctly or evaluation is inconsistent
+             # For safety, use the re-evaluated fitness
+             best_fitness = evaluated_fitness
+             # print(f"Warning: DEAP fitness mismatch. Using re-evaluated fitness: {best_fitness}") # Debugging
+
         return best_ind, best_fitness, None # Devolver el mejor, su fitness y sin error
     else:
-        return None, 0.0, "La población se volvió vacía durante la ejecución del AG."
+        return None, 0.0, "La población se volvió vacía o inválida durante la ejecución del AG."
 
 
 # ----------------------- Interfaz de Streamlit -----------------------
@@ -290,16 +342,20 @@ df = load_data(uploaded_file) # Usar la función cacheada
 
 numero_a_atraso = {}
 atrasos_disponibles = []
-distribucion_probabilidad = {} # Se generará después de cargar los datos
+distribucion_probabilidad = {}
+atraso_counts = {} # Diccionario para almacenar la cuenta de cada atraso
 
 if df is not None:
-    # Mapear número a atraso
-    # Filtrar filas donde Atraso sea -1 (errores de conversión)
+    # Mapear número a atraso y filtrar filas inválidas
     df_valid = df[df['Atraso'] != -1].copy()
     numero_a_atraso = dict(zip(df_valid['Numero'], df_valid['Atraso']))
 
-    # Obtener atrasos disponibles
-    atrasos_disponibles = sorted(list(set(df_valid['Atraso'].tolist())))
+    # Obtener atrasos disponibles (únicos y válidos) y su conteo
+    if not df_valid.empty:
+        atrasos_disponibles = sorted(list(set(df_valid['Atraso'].tolist())))
+        # Calculate counts and convert keys to string for consistency with restrictions
+        atraso_counts = df_valid['Atraso'].value_counts().rename(index=str).to_dict()
+
 
     # Generar distribución de probabilidad uniforme para los números válidos
     # Asume que todos los números válidos tienen la misma probabilidad
@@ -308,12 +364,14 @@ if df is not None:
         prob_por_numero = 1.0 / len(numeros_validos)
         distribucion_probabilidad = {num: prob_por_numero for num in numeros_validos}
         st.info(f"Distribución de probabilidad uniforme generada para {len(numeros_validos)} números válidos encontrados.")
-        st.write(f"Atrasos disponibles en los datos: {atrasos_disponibles}")
+        st.write(f"Atrasos disponibles en los datos válidos: {atrasos_disponibles}")
+        st.write("Conteo de cada atraso en los datos:", atraso_counts)
     else:
-        st.warning("No se encontraron números válidos con atraso en el archivo. No se pueden realizar cálculos.")
+        st.warning("No se encontraron números válidos con atraso en el archivo (verifica columnas 'Numero' y 'Atraso'). No se pueden realizar cálculos.")
         numero_a_atraso = {}
         atrasos_disponibles = []
         distribucion_probabilidad = {}
+        atraso_counts = {}
 
 
 # --- Configuración de Parámetros y Restricciones ---
@@ -321,38 +379,32 @@ st.header("2. Configurar Parámetros")
 
 n_selecciones = 6 # Número fijo de selecciones por combinación
 
-st.subheader("Restricciones de Atraso")
-st.write(f"Define la cantidad máxima de números permitida para cada valor de 'Atraso' en una combinación de {n_selecciones} números.")
+st.subheader(f"Restricciones de Atraso (para combinaciones de {n_selecciones} números)")
+st.write("Define la cantidad máxima de números permitida en una combinación para cada valor de 'Atraso'.")
+st.info("Los valores por defecto se basan en la cantidad de números con cada atraso en tu archivo.")
 
-restricciones_atraso_config = {}
+restricciones_finales = {}
 if atrasos_disponibles:
-    st.info(f"Selecciona los valores de 'Atraso' que quieres restringir y establece un límite (entre 0 y {n_selecciones}).")
-    # Puedes pre-seleccionar algunos atrasos comunes o dejarlo vacío
-    default_selected_atrasos = [str(a) for a in [0, 2, 4, 6, 8, 10, 12, 14] if a in atrasos_disponibles] # Ejemplo de default
-    selected_atrasos_to_restrict = st.multiselect(
-        "Selecciona los valores de 'Atraso' a restringir:",
-        options=[str(a) for a in atrasos_disponibles], # Asegurarse que las opciones son strings
-        default=default_selected_atrasos if default_selected_atrasos else ([str(atrasos_disponibles[0])] if atrasos_disponibles else []) # Ejemplo: seleccionar el primero si hay, o nada
-    )
+    st.write("Configura los límites para cada atraso disponible:")
+    # Aseguramos que los atrasos disponibles en la UI son strings
+    atrasos_disponibles_str = sorted([str(a) for a in atrasos_disponibles])
 
-    # Diccionario para las restricciones finales (usamos claves str)
-    restricciones_finales = {}
-    if selected_atrasos_to_restrict:
-         st.write("Define los límites:")
-         for atraso_str in selected_atrasos_to_restrict:
-            # Intentar obtener un valor por defecto si existe en las restricciones de ejemplo del código original
-            default_limit_example = {'0':20, '2':12, '4':2, '6':3, '8':5, '10':2, '12':1, '14':1}.get(atraso_str, n_selecciones)
-            limit = st.number_input(
-                f"Máximo permitido para Atraso '{atraso_str}':",
-                min_value=0,
-                max_value=n_selecciones,
-                value=default_limit_example,
-                step=1,
-                key=f"restriction_{atraso_str}" # Clave única para cada input
-            )
-            restricciones_finales[atraso_str] = limit
+    for atraso_str in atrasos_disponibles_str:
+        # Get the default value from the calculated counts, default to 0 if somehow missing
+        default_limit = atraso_counts.get(atraso_str, 0)
+        limit = st.number_input(
+            f"Máximo permitido para Atraso '{atraso_str}':",
+            min_value=0,
+            # Max value is the total number of selections
+            max_value=n_selecciones,
+            value=default_limit, # Set the default value based on count
+            step=1,
+            key=f"restriction_{atraso_str}" # Clave única para cada input
+        )
+        # Store the user's chosen limit (could be the default or a changed value)
+        restricciones_finales[atraso_str] = limit
 
-    st.write("Restricciones configuradas:", restricciones_finales if restricciones_finales else "Ninguna")
+    st.write("Restricciones configuradas:", restricciones_finales if restricciones_finales else "Ninguna restricción específica aplicada.")
 
 else:
     st.info("Carga un archivo CSV con datos de 'Atraso' para configurar las restricciones.")
@@ -361,8 +413,8 @@ else:
 
 # --- Parámetros de Algoritmos ---
 st.subheader("Parámetros del Algoritmo Genético")
-ga_ngen = st.slider("Número de Generaciones", 10, 500, 100) # Rango ampliado
-ga_npob = st.slider("Tamaño de la Población", 100, 2000, 500) # Rango ampliado
+ga_ngen = st.slider("Número de Generaciones", 10, 1000, 100) # Rango ampliado, 100-500 es común
+ga_npob = st.slider("Tamaño de la Población", 100, 5000, 500) # Rango ampliado, 300-1000 es común
 ga_cxpb = st.slider("Probabilidad de Cruce (CXPB)", 0.0, 1.0, 0.7, 0.05) # Valor típico 0.5-0.9
 ga_mutpb = st.slider("Probabilidad de Mutación (MUTPB)", 0.0, 1.0, 0.1, 0.01) # Valor típico 0.1-0.3
 
@@ -374,24 +426,24 @@ sim_n_ejecuciones = st.number_input("Número de Ejecuciones Concurrentes", min_v
 # --- Ejecución del Algoritmo Genético ---
 st.header("3. Ejecutar Algoritmo Genético")
 
+# Only enable button if necessary data is loaded
 if df is not None and distribucion_probabilidad and numero_a_atraso:
     if st.button("Ejecutar GA para encontrar la combinación más probable"):
         if not restricciones_finales:
-            st.warning("No se han definido restricciones de atraso. Esto podría afectar los resultados.")
+            st.warning("No se han definido restricciones de atraso. Esto significa que cualquier combinación válida de 6 números será considerada por el AG.")
 
-        st.info("Ejecutando Algoritmo Genético...")
-        with st.spinner(f"Buscando mejor combinación por {ga_ngen} generaciones..."):
-            # Pasamos los parámetros y datos necesarios a la función
-            mejor_individuo, mejor_fitness, error_msg = ejecutar_algoritmo_genetico(
-                n_generaciones=ga_ngen,
-                n_poblacion=ga_npob,
-                cxpb=ga_cxpb,
-                mutpb=ga_mutpb,
-                distribucion_prob=distribucion_probabilidad,
-                numero_a_atraso=numero_a_atraso,
-                restricciones_atraso=restricciones_finales,
-                n_selecciones=n_selecciones
-            )
+        st.info("Iniciando Algoritmo Genético...")
+        # Pass all necessary parameters and data
+        mejor_individuo, mejor_fitness, error_msg = ejecutar_algoritmo_genetico(
+            n_generaciones=ga_ngen,
+            n_poblacion=ga_npob,
+            cxpb=ga_cxpb,
+            mutpb=ga_mutpb,
+            distribucion_prob=distribucion_probabilidad,
+            numero_a_atraso=numero_a_atraso,
+            restricciones_atraso=restricciones_finales,
+            n_selecciones=n_selecciones
+        )
 
         if error_msg:
              st.error(error_msg)
@@ -413,10 +465,11 @@ else:
 # --- Ejecución de la Simulación Concurrente ---
 st.header("4. Ejecutar Simulación Concurrente")
 
+# Only enable button if necessary data is loaded
 if df is not None and distribucion_probabilidad and numero_a_atraso:
      if st.button(f"Ejecutar Simulación ({sim_n_ejecuciones} ejecuciones)"):
         if not restricciones_finales:
-            st.warning("No se han definido restricciones de atraso. Esto podría afectar los resultados.")
+            st.warning("No se han definido restricciones de atraso. Esto significa que la simulación generará combinaciones sin tener en cuenta límites por atraso.")
 
         st.info(f"Ejecutando {sim_n_ejecuciones} simulaciones concurrentes generando {sim_n_combinaciones} combinaciones por ejecución...")
         with st.spinner("Generando y procesando combinaciones en paralelo..."):
@@ -449,7 +502,8 @@ if df is not None and distribucion_probabilidad and numero_a_atraso:
 
                     for comb_tuple, ejecuciones_list in combinaciones_coincidentes.items():
                         # Obtener la probabilidad y frecuencia de la primera ejecución donde apareció
-                        freq_prob = first_run_results_map.get(comb_tuple, (0, 0.0)) # Default a 0 si no se encuentra (no debería pasar si está en coincidentes)
+                        # .get() will handle cases where the key might not be in the first run's map (shouldn't happen for coincident ones, but safe)
+                        freq_prob = first_run_results_map.get(comb_tuple, (0, 0.0))
                         frecuencia_en_primera_ejecucion = freq_prob[0]
                         probabilidad_calculada = freq_prob[1]
 
@@ -470,7 +524,7 @@ if df is not None and distribucion_probabilidad and numero_a_atraso:
                     st.dataframe(coincident_list_sorted, height=400) # Mostrar como tabla
 
                 else:
-                    st.info("No se encontraron combinaciones que aparecieran en *todas* las simulaciones con las restricciones dadas.")
+                    st.info(f"No se encontraron combinaciones que aparecieran en *todas* las {sim_n_ejecuciones} simulaciones con las restricciones dadas.")
 
             except Exception as e:
                  st.error(f"Ocurrió un error durante la ejecución de la Simulación Concurrente: {e}")
