@@ -21,7 +21,7 @@ if "Individual" not in creator.__dict__:
 
 @st.cache_data # Cache the data loading result
 def load_data_and_counts(uploaded_file):
-    """Carga, valida el archivo CSV y calcula las cuentas de atraso."""
+    """Carga, valida el archivo CSV, calcula las cuentas de atraso y la suma total."""
     if uploaded_file is not None:
         try:
             df = pd.read_csv(uploaded_file)
@@ -31,12 +31,13 @@ def load_data_and_counts(uploaded_file):
                 # Convert Atraso to numeric, coerce errors to NaN, fill NaN with -1, then to int
                 df['Atraso'] = pd.to_numeric(df['Atraso'], errors='coerce').fillna(-1).astype(int)
 
-                # Filter out invalid atrasos before mapping and counting
+                # Filter out invalid atrasos before mapping, counting, and summing
                 df_valid = df[df['Atraso'] != -1].copy()
 
                 if df_valid.empty:
                      st.warning("No se encontraron filas válidas con 'Numero' y 'Atraso' numérico.")
-                     return None, {}, {}, []
+                     # Retorna valores vacíos y suma 0
+                     return None, {}, {}, [], {}, 0
 
                 st.success("Archivo cargado exitosamente.")
                 st.dataframe(df.head())
@@ -58,17 +59,23 @@ def load_data_and_counts(uploaded_file):
                 st.write(f"Atrasos disponibles en los datos: {atrasos_disponibles_int}")
                 st.write("Conteo de cada atraso encontrado:", atraso_counts)
 
+                # Calcular la suma total de todos los atrasos en el dataset
+                total_atraso_dataset = df_valid['Atraso'].sum()
 
-                # Retornar todos los datos procesados, incluyendo los conteos
-                return df_valid, numero_a_atraso, distribucion_probabilidad, atrasos_disponibles_int, atraso_counts
+
+                # Retornar todos los datos procesados, incluyendo los conteos y la suma total
+                return df_valid, numero_a_atraso, distribucion_probabilidad, atrasos_disponibles_int, atraso_counts, total_atraso_dataset
 
             else:
                  st.error("El archivo CSV debe contener las columnas 'Numero' y 'Atraso'.")
-                 return None, {}, {}, [], {} # Retorna valores vacíos en caso de error
+                 # Retorna valores vacíos y suma 0 en caso de error
+                 return None, {}, {}, [], {}, 0
         except Exception as e:
             st.error(f"Error al leer o procesar el archivo CSV: {e}")
-            return None, {}, {}, [], {} # Retorna valores vacíos en caso de error
-    return None, {}, {}, [], {} # Retorna valores vacíos si no hay archivo
+            # Retorna valores vacíos y suma 0 en caso de error
+            return None, {}, {}, [], {}, 0
+    # Retorna valores vacíos y suma 0 si no hay archivo
+    return None, {}, {}, [], {}, 0
 
 
 def generar_combinaciones_con_restricciones(distribucion_probabilidad, numero_a_atraso, restricciones_atraso, n_selecciones, n_combinaciones):
@@ -122,12 +129,14 @@ def generar_combinaciones_con_restricciones(distribucion_probabilidad, numero_a_
     for combinacion, frecuencia in conteo_combinaciones.items():
         prob_comb = 1.0
         try:
+            # Usar .get(val, 0) en caso de que un valor no se encuentre (aunque con validación previa no debería pasar)
             prob_comb = np.prod([distribucion_probabilidad.get(val, 0) for val in combinacion])
         except Exception:
             prob_comb = 0
 
         probabilidad_combinaciones[combinacion] = (frecuencia, prob_comb)
 
+    # Ordenar las combinaciones por probabilidad (descendente) y luego por frecuencia (descendente)
     combinaciones_ordenadas = sorted(
         probabilidad_combinaciones.items(),
         key=lambda x: (-x[1][1], -x[1][0])
@@ -191,10 +200,8 @@ def generar_individuo_deap(distribucion_prob, num_atraso, restr_atraso, n_sel):
         if not valores_posibles:
             break
 
-        if not valores_posibles: # Double check needed? No, break handles it.
-            # Fallback: if somehow stuck, return incomplete individual
-            break
-
+        if not valores_posibles: # This check is redundant due to the first break, but kept for clarity
+             break
 
         nuevo_valor = random.choice(valores_posibles)
 
@@ -271,10 +278,15 @@ st.write("Esta aplicación te ayuda a encontrar combinaciones de números, consi
 st.header("1. Cargar Datos de Atraso")
 uploaded_file = st.file_uploader("Sube tu archivo CSV (debe contener las columnas 'Numero' y 'Atraso')", type="csv")
 
-# Modificamos la llamada para obtener los conteos
-df, numero_a_atraso, distribucion_probabilidad, atrasos_disponibles_int, atraso_counts = load_data_and_counts(uploaded_file)
+# Modificamos la llamada para obtener los conteos Y la suma total
+df, numero_a_atraso, distribucion_probabilidad, atrasos_disponibles_int, atraso_counts, total_atraso_dataset = load_data_and_counts(uploaded_file)
 
 n_selecciones = 6 # Número fijo de selecciones por combinación
+
+# Mostrar la suma total del dataset después de cargar
+if df is not None and total_atraso_dataset is not None:
+     st.info(f"**Suma total de todos los 'Atraso' en el dataset cargado:** {total_atraso_dataset}")
+
 
 # --- Configuración de Parámetros y Restricciones ---
 st.header("2. Configurar Parámetros")
@@ -307,6 +319,7 @@ if atrasos_disponibles_int:
                 step=1,
                 key=f"restriction_{atraso_str}"
             )
+            # Asegurarse de guardar la restricción como string key -> int limit
             restricciones_finales[atraso_str] = limit
 
     st.write("Restricciones configuradas:", restricciones_finales if restricciones_finales else "Ninguna")
@@ -333,7 +346,7 @@ sim_n_ejecuciones = st.number_input("Número de Ejecuciones Concurrentes", min_v
 st.header("3. Ejecutar Algoritmo Genético")
 
 # Solo permitir ejecución si hay datos válidos cargados
-if numero_a_atraso and distribucion_probabilidad:
+if numero_a_atraso and distribucion_probabilidad and total_atraso_dataset is not None:
     if st.button("Ejecutar GA para encontrar la combinación más probable"):
         if not restricciones_finales:
             st.warning("No se han definido restricciones de atraso. Esto podría afectar los resultados.")
@@ -358,8 +371,17 @@ if numero_a_atraso and distribucion_probabilidad:
             st.write("Combinación:", " - ".join(map(str, mejor_individuo)))
             st.write("Fitness (Probabilidad Calculada):", f"{mejor_fitness:.12f}")
 
-            atrasos_best_ind = Counter([numero_a_atraso.get(val) for val in mejor_individuo if numero_a_atraso.get(val) is not None and numero_a_atraso.get(val) != -1])
-            st.write("Distribución de Atrasos en esta combinación:", dict(atrasos_best_ind))
+            # Calcular suma de atrasos para el mejor individuo
+            # Asegurarse de que los números del individuo estén en numero_a_atraso antes de sumar
+            suma_atrasos_mejor_individuo = sum(numero_a_atraso.get(val, 0) for val in mejor_individuo)
+            st.write("Suma de Atrasos de esta combinación:", suma_atrasos_mejor_individuo)
+
+            # Calcular el valor especial
+            valor_especial_mejor_individuo = total_atraso_dataset + 40 - suma_atrasos_mejor_individuo
+            st.write(f"**Cálculo Especial:** ({total_atraso_dataset} [Suma Atrasos Dataset] + 40 - {suma_atrasos_mejor_individuo} [Suma Atrasos Combinación]) = **{valor_especial_mejor_individuo}**")
+
+            atrasos_best_ind_counts = Counter([numero_a_atraso.get(val) for val in mejor_individuo if numero_a_atraso.get(val) is not None and numero_a_atraso.get(val) != -1])
+            st.write("Distribución de Atrasos (Conteos) en esta combinación:", dict(atrasos_best_ind_counts))
         else:
             st.warning("El algoritmo genético no pudo encontrar una combinación válida.")
 
@@ -371,7 +393,7 @@ else:
 st.header("4. Ejecutar Simulación Concurrente")
 
 # Solo permitir ejecución si hay datos válidos cargados
-if numero_a_atraso and distribucion_probabilidad:
+if numero_a_atraso and distribucion_probabilidad and total_atraso_dataset is not None:
      if st.button(f"Ejecutar Simulación ({sim_n_ejecuciones} ejecuciones)"):
         if not restricciones_finales:
             st.warning("No se han definido restricciones de atraso. Esto podría afectar los resultados.")
@@ -394,22 +416,37 @@ if numero_a_atraso and distribucion_probabilidad:
 
                 if combinaciones_coincidentes:
                     coincident_list = []
+                    # Podemos usar los resultados de la primera ejecución para obtener probabilidad y frecuencia
+                    # asumiendo que la probabilidad es una propiedad intrínseca de la combinación y los datos
                     first_run_results_map = dict(resultados_por_ejecucion[0]) if resultados_por_ejecucion else {}
 
                     for comb_tuple, ejecuciones_list in combinaciones_coincidentes.items():
+                        # Obtener la probabilidad de la primera ejecución donde apareció
                         freq_prob = first_run_results_map.get(comb_tuple, (0, 0.0))
                         probabilidad_calculada = freq_prob[1]
 
-                        atrasos_comb = Counter([numero_a_atraso.get(val) for val in comb_tuple if numero_a_atraso.get(val) is not None and numero_a_atraso.get(val) != -1])
-                        atrasos_str = ", ".join([f"A{k}:{v}" for k, v in atrasos_comb.items()])
+                        # Calcular suma de atrasos para esta combinación
+                        # Asegurarse de que los números de la combinación estén en numero_a_atraso antes de sumar
+                        suma_atrasos_comb = sum(numero_a_atraso.get(val, 0) for val in comb_tuple)
+
+                        # Calcular el valor especial para esta combinación
+                        valor_especial_comb = total_atraso_dataset + 40 - suma_atrasos_comb
+
+                        # Calcular atrasos (conteos) para esta combinación para mostrar
+                        atrasos_comb_counts = Counter([numero_a_atraso.get(val) for val in comb_tuple if numero_a_atraso.get(val) is not None and numero_a_atraso.get(val) != -1])
+                        atrasos_str = ", ".join([f"A{k}:{v}" for k, v in atrasos_comb_counts.items()])
+
 
                         coincident_list.append({
                             "Combinación": " - ".join(map(str, comb_tuple)),
                             "Probabilidad": probabilidad_calculada,
                             f"Apariciones (de {sim_n_ejecuciones} ejec.)": len(ejecuciones_list),
-                            "Atrasos": atrasos_str
+                            "Suma Atrasos Combinación": suma_atrasos_comb, # Agregar la suma de atrasos de la combinación
+                            "Cálculo Especial": valor_especial_comb, # Agregar el cálculo especial
+                            "Atrasos (Conteos)": atrasos_str # Mantener los conteos de atraso
                         })
 
+                    # Ordenar por probabilidad descendente (o podrías ordenar por el cálculo especial si fuera relevante)
                     coincident_list_sorted = sorted(coincident_list, key=lambda x: x["Probabilidad"], reverse=True)
 
                     st.dataframe(coincident_list_sorted, height=400)
@@ -432,6 +469,13 @@ Ayuda a encontrar combinaciones de números (ej. para loterías) basándose en d
 
 **Datos:**
 Requiere un archivo CSV con al menos las columnas 'Numero' y 'Atraso'. Los números en la columna 'Numero' deben ser únicos.
+
+**Suma Total de Atrasos:**
+Al cargar el archivo, se calcula y muestra la suma de todos los valores de la columna 'Atraso' en tus datos.
+
+**Cálculo Especial:**
+Para cada combinación encontrada, se calcula:
+`(Suma Total de Atrasos en Dataset) + 40 - (Suma de Atrasos de esta Combinación)`
 
 **Configuración de Restricciones:**
 *   La sección de Restricciones de Atraso ahora **carga automáticamente** todos los valores de 'Atraso' encontrados en tu archivo CSV.
